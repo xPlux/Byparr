@@ -175,6 +175,14 @@ async def read_item(request: LinkRequest, dep: CamoufoxDep) -> LinkResponse:
             status_code=408,
             detail="Timed out while solving the challenge",
         ) from e
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Browser request failed: %s", e)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Browser request failed: {e}",
+        ) from e
 
     cookies = await dep.context.cookies()
 
