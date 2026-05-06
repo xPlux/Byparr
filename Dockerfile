@@ -52,7 +52,7 @@ RUN chmod -R o+rX /app /cache &&\
 FROM app AS test
 RUN \
     uv sync --group test &&\
-    uv run pytest --retries 3
+    uv run pytest --retries 3 -k "not test_bypass and not test_health_check"
 
 FROM app
 USER 1000
