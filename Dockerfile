@@ -39,6 +39,18 @@ RUN mkdir -p /cache &&\
     uv run camoufox fetch &&\
     apt-get update &&\
     uv run playwright install-deps firefox &&\
+    apt-get install -y --no-install-recommends \
+        libgtk-3-0t64 \
+        libdbus-glib-1-2 \
+        libasound2t64 \
+        libxtst6 \
+        libx11-xcb1 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxrandr2 \
+        libpangocairo-1.0-0 \
+        libpango-1.0-0 \
+        libcairo2 &&\
     uv cache clean &&\
     apt-get clean &&\
     rm -rf /var/lib/apt/lists/*
