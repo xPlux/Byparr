@@ -11,6 +11,19 @@ from pydantic.alias_generators import to_camel
 from src import consts
 
 
+class InputCookie(BaseModel):
+    model_config = {"populate_by_name": True}
+
+    name: str
+    value: str
+    domain: str | None = None
+    path: str | None = None
+    expires: float | int | None = None
+    http_only: bool | None = Field(default=None, alias="httpOnly")
+    secure: bool | None = None
+    same_site: str | None = Field(default=None, alias="sameSite")
+
+
 class LinkRequest(BaseModel):
     cmd: str = Field(
         default="request.get",
@@ -20,6 +33,10 @@ class LinkRequest(BaseModel):
     max_timeout: int = Field(
         default=60,
         description="Maximum timeout in seconds for resolving the anti-bot challenge.",
+    )
+    cookies: list[InputCookie] | None = Field(
+        default=None,
+        description="Optional cookies to pre-load into the browser context using FlareSolverr request format.",
     )
 
 

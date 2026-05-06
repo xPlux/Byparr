@@ -65,6 +65,42 @@ Once running, open:
 - `http://localhost:8191/docs`
 - `http://localhost:8191/` (redirects to `/docs`)
 
+### FlareSolverr-compatible input cookies
+
+`POST /v1` accepts `cookies` in the same request format as FlareSolverr:
+
+```json
+{
+   "cmd": "request.get",
+   "url": "https://example.com",
+   "cookies": [
+      {
+         "name": "cf_clearance",
+         "value": "token",
+         "domain": ".example.com",
+         "path": "/",
+         "expires": 1893456000,
+         "httpOnly": true,
+         "secure": true,
+         "sameSite": "None"
+      }
+   ]
+}
+```
+
+Minimal cookie format is also supported:
+
+```json
+{
+   "cmd": "request.get",
+   "url": "https://example.com",
+   "cookies": [{ "name": "cookie1", "value": "value1" }]
+}
+```
+
+Input cookies matching Cloudflare names (`cf_*`, `__cf*`, `cf_clearance`, `__cf_bm`) are ignored,
+so they are not overwritten by request payload cookies.
+
 ## Troubleshooting
 
 ### Docker troubleshooting
