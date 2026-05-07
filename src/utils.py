@@ -92,7 +92,7 @@ async def get_camoufox(
         }
 
     try:
-        async with AsyncCamoufox(
+        camoufox = AsyncCamoufox(
             main_world_eval=True,
             addons=[ADDON_PATH],
             geoip=True,
@@ -103,7 +103,21 @@ async def get_camoufox(
             i_know_what_im_doing=True,
             config={"forceScopeAccess": True},  # add this when creating Camoufox instance
             disable_coop=True,  # add this when creating Camoufox instance
-        ) as browser_raw:
+        )
+        try:
+            browser_raw = await camoufox.__aenter__()
+        except BaseException as enter_exc:
+            # Camoufox.__aenter__ leaks the playwright node driver if launch fails
+            # (e.g. invalid proxy raises before browser launch). Force cleanup.
+            playwright_cm = getattr(camoufox, "_playwright_context_manager", None) or camoufox
+            try:
+                await playwright_cm.__aexit__(
+                    type(enter_exc), enter_exc, enter_exc.__traceback__
+                )
+            except Exception as cleanup_exc:
+                logger.warning("Playwright cleanup after launch failure failed: %s", cleanup_exc)
+            raise
+        try:
             # Cast to Browser since AsyncCamoufox always returns a Browser, not BrowserContext
             browser = cast("Browser", browser_raw)
             context = await browser.new_context()
@@ -115,6 +129,22 @@ async def get_camoufox(
                 attempt_delay=1,
             ) as solver:
                 yield CamoufoxDepClass(page, solver, context)
+        finally:
+            # AsyncCamoufox.__aexit__ first calls browser.close() then stops the
+            # playwright node driver. If browser.close() raises (e.g. browser already
+            # crashed), the node process leaks. Force-stop both stages.
+            try:
+                if camoufox.browser is not None:
+                    try:
+                        await camoufox.browser.close()
+                    except Exception as close_exc:
+                        logger.warning("browser.close() failed: %s", close_exc)
+            finally:
+                playwright_cm = getattr(camoufox, "_playwright_context_manager", None) or camoufox
+                try:
+                    await playwright_cm.__aexit__(None, None, None)
+                except Exception as stop_exc:
+                    logger.warning("Playwright stop failed: %s", stop_exc)
     except HTTPException:
         raise
     except Exception as e:
