@@ -1,11 +1,14 @@
+import asyncio
 import logging
+import shutil
+import tempfile
 import time
 from collections.abc import AsyncGenerator
 from typing import Annotated, NamedTuple, cast
 
 from camoufox import AsyncCamoufox
 from fastapi import Header, HTTPException
-from playwright.async_api import Browser, BrowserContext, Page
+from playwright.async_api import BrowserContext, Page
 from playwright_captcha import (
     ClickSolver,
     FrameworkType,
@@ -50,6 +53,43 @@ class CamoufoxDepClass(NamedTuple):
     context: BrowserContext
 
 
+async def _close_resource(resource, resource_name: str):
+    if resource is None:
+        return None
+
+    try:
+        await resource.close()
+    except BaseException as cleanup_error:
+        if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
+            raise
+        logger.warning("%s failed: %s", resource_name, cleanup_error)
+        return cleanup_error
+
+    return None
+
+
+async def _stop_camoufox(camoufox, exit_error: BaseException | None = None):
+    try:
+        camoufox.browser = None
+    except Exception as cleanup_error:
+        logger.warning("Clearing Camoufox browser handle failed: %s", cleanup_error)
+
+    playwright_cm = getattr(camoufox, "_playwright_context_manager", None) or camoufox
+    try:
+        await playwright_cm.__aexit__(
+            type(exit_error) if exit_error else None,
+            exit_error,
+            exit_error.__traceback__ if exit_error else None,
+        )
+    except BaseException as cleanup_error:
+        if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
+            raise
+        logger.warning("Playwright stop failed: %s", cleanup_error)
+        return cleanup_error
+
+    return None
+
+
 async def get_camoufox(
     x_proxy_server: Annotated[
         str | None,
@@ -91,6 +131,10 @@ async def get_camoufox(
             "password": PROXY_PASSWORD,
         }
 
+    profile_dir = tempfile.mkdtemp(prefix="byparr_camoufox_profile-")
+    page = None
+    context = None
+
     try:
         camoufox = AsyncCamoufox(
             main_world_eval=True,
@@ -103,24 +147,16 @@ async def get_camoufox(
             i_know_what_im_doing=True,
             config={"forceScopeAccess": True},  # add this when creating Camoufox instance
             disable_coop=True,  # add this when creating Camoufox instance
+            persistent_context=True,
+            user_data_dir=profile_dir,
         )
         try:
-            browser_raw = await camoufox.__aenter__()
+            context_raw = await camoufox.__aenter__()
         except BaseException as enter_exc:
-            # Camoufox.__aenter__ leaks the playwright node driver if launch fails
-            # (e.g. invalid proxy raises before browser launch). Force cleanup.
-            playwright_cm = getattr(camoufox, "_playwright_context_manager", None) or camoufox
-            try:
-                await playwright_cm.__aexit__(
-                    type(enter_exc), enter_exc, enter_exc.__traceback__
-                )
-            except Exception as cleanup_exc:
-                logger.warning("Playwright cleanup after launch failure failed: %s", cleanup_exc)
+            await _stop_camoufox(camoufox, enter_exc)
             raise
         try:
-            # Cast to Browser since AsyncCamoufox always returns a Browser, not BrowserContext
-            browser = cast("Browser", browser_raw)
-            context = await browser.new_context()
+            context = cast("BrowserContext", context_raw)
             page = await context.new_page()
             async with ClickSolver(
                 framework=FrameworkType.CAMOUFOX,
@@ -130,21 +166,12 @@ async def get_camoufox(
             ) as solver:
                 yield CamoufoxDepClass(page, solver, context)
         finally:
-            # AsyncCamoufox.__aexit__ first calls browser.close() then stops the
-            # playwright node driver. If browser.close() raises (e.g. browser already
-            # crashed), the node process leaks. Force-stop both stages.
-            try:
-                if camoufox.browser is not None:
-                    try:
-                        await camoufox.browser.close()
-                    except Exception as close_exc:
-                        logger.warning("browser.close() failed: %s", close_exc)
-            finally:
-                playwright_cm = getattr(camoufox, "_playwright_context_manager", None) or camoufox
-                try:
-                    await playwright_cm.__aexit__(None, None, None)
-                except Exception as stop_exc:
-                    logger.warning("Playwright stop failed: %s", stop_exc)
+            cleanup_error = None
+            cleanup_error = await _close_resource(page, "page.close()") or cleanup_error
+            cleanup_error = await _close_resource(context, "context.close()") or cleanup_error
+            cleanup_error = await _stop_camoufox(camoufox) or cleanup_error
+            if isinstance(cleanup_error, asyncio.CancelledError):
+                raise cleanup_error
     except HTTPException:
         raise
     except Exception as e:
@@ -153,3 +180,5 @@ async def get_camoufox(
             status_code=502,
             detail=f"Failed to launch browser: {e}",
         ) from e
+    finally:
+        shutil.rmtree(profile_dir, ignore_errors=True)
