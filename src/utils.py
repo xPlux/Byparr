@@ -1,5 +1,7 @@
 import asyncio
+import glob
 import logging
+import os
 import shutil
 import tempfile
 import time
@@ -8,7 +10,7 @@ from typing import Annotated, NamedTuple, cast
 
 from camoufox import AsyncCamoufox
 from fastapi import Header, HTTPException
-from playwright.async_api import BrowserContext, Page
+from playwright.async_api import Browser, BrowserContext, Page
 from playwright_captcha import (
     ClickSolver,
     FrameworkType,
@@ -36,6 +38,25 @@ logger = logging.getLogger("uvicorn.error")
 logger.setLevel(LOG_LEVEL)
 if len(logger.handlers) == 0:
     logger.addHandler(logging.StreamHandler())
+
+PROFILE_DIR_PREFIX = "byparr_camoufox_profile-"
+_TMP_DIR = tempfile.gettempdir()
+
+
+def sweep_stale_tmp_dirs() -> None:
+    """Remove leftover camoufox/playwright tmp dirs from previous runs.
+
+    Killed/restarted containers can leave behind profile and playwright artifact
+    directories that the per-request finally block never got to clean.
+    """
+    patterns = (f"{PROFILE_DIR_PREFIX}*", "playwright-artifacts-*")
+    removed = 0
+    for pattern in patterns:
+        for path in glob.glob(os.path.join(_TMP_DIR, pattern)):
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    if removed:
+        logger.info("Swept %d stale tmp dirs on startup", removed)
 
 
 class TimeoutTimer(BaseModel):
@@ -131,7 +152,6 @@ async def get_camoufox(
             "password": PROXY_PASSWORD,
         }
 
-    profile_dir = tempfile.mkdtemp(prefix="byparr_camoufox_profile-")
     page = None
     context = None
 
@@ -147,16 +167,15 @@ async def get_camoufox(
             i_know_what_im_doing=True,
             config={"forceScopeAccess": True},  # add this when creating Camoufox instance
             disable_coop=True,  # add this when creating Camoufox instance
-            persistent_context=True,
-            user_data_dir=profile_dir,
         )
         try:
-            context_raw = await camoufox.__aenter__()
+            browser_raw = await camoufox.__aenter__()
         except BaseException as enter_exc:
             await _stop_camoufox(camoufox, enter_exc)
             raise
         try:
-            context = cast("BrowserContext", context_raw)
+            browser = cast("Browser", browser_raw)
+            context = await browser.new_context()
             page = await context.new_page()
             async with ClickSolver(
                 framework=FrameworkType.CAMOUFOX,
@@ -180,5 +199,3 @@ async def get_camoufox(
             status_code=502,
             detail=f"Failed to launch browser: {e}",
         ) from e
-    finally:
-        shutil.rmtree(profile_dir, ignore_errors=True)

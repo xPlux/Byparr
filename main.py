@@ -11,10 +11,12 @@ from fastapi.middleware.gzip import GZipMiddleware
 from src.consts import HOST, LOG_LEVEL, PORT, VERSION
 from src.endpoints import health_check, router
 from src.middlewares import LogRequest
-from src.utils import get_camoufox, logger
+from src.utils import get_camoufox, logger, sweep_stale_tmp_dirs
 
 logger.info("Using version %s", VERSION)
 logger.info("Log level set to %s", logging.getLevelName(LOG_LEVEL))
+
+sweep_stale_tmp_dirs()
 
 app = FastAPI(debug=LOG_LEVEL == logging.DEBUG, log_level=LOG_LEVEL)
 app.add_middleware(GZipMiddleware)
