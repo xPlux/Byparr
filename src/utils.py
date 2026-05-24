@@ -1,4 +1,3 @@
-import asyncio
 import glob
 import logging
 import os
@@ -49,7 +48,11 @@ def sweep_stale_tmp_dirs() -> None:
     Killed/restarted containers can leave behind profile and playwright artifact
     directories that the per-request finally block never got to clean.
     """
-    patterns = (f"{PROFILE_DIR_PREFIX}*", "playwright-artifacts-*")
+    patterns = (
+        f"{PROFILE_DIR_PREFIX}*",
+        "playwright-artifacts-*",
+        "playwright_firefoxdev_profile-*",
+    )
     removed = 0
     for pattern in patterns:
         for path in glob.glob(os.path.join(_TMP_DIR, pattern)):
@@ -72,43 +75,6 @@ class CamoufoxDepClass(NamedTuple):
     page: Page
     solver: ClickSolver
     context: BrowserContext
-
-
-async def _close_resource(resource, resource_name: str):
-    if resource is None:
-        return None
-
-    try:
-        await resource.close()
-    except BaseException as cleanup_error:
-        if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
-            raise
-        logger.warning("%s failed: %s", resource_name, cleanup_error)
-        return cleanup_error
-
-    return None
-
-
-async def _stop_camoufox(camoufox, exit_error: BaseException | None = None):
-    try:
-        camoufox.browser = None
-    except Exception as cleanup_error:
-        logger.warning("Clearing Camoufox browser handle failed: %s", cleanup_error)
-
-    playwright_cm = getattr(camoufox, "_playwright_context_manager", None) or camoufox
-    try:
-        await playwright_cm.__aexit__(
-            type(exit_error) if exit_error else None,
-            exit_error,
-            exit_error.__traceback__ if exit_error else None,
-        )
-    except BaseException as cleanup_error:
-        if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
-            raise
-        logger.warning("Playwright stop failed: %s", cleanup_error)
-        return cleanup_error
-
-    return None
 
 
 async def get_camoufox(
@@ -152,11 +118,8 @@ async def get_camoufox(
             "password": PROXY_PASSWORD,
         }
 
-    page = None
-    context = None
-
     try:
-        camoufox = AsyncCamoufox(
+        async with AsyncCamoufox(
             main_world_eval=True,
             addons=[ADDON_PATH],
             geoip=True,
@@ -165,15 +128,9 @@ async def get_camoufox(
             headless=True,
             humanize=True,
             i_know_what_im_doing=True,
-            config={"forceScopeAccess": True},  # add this when creating Camoufox instance
-            disable_coop=True,  # add this when creating Camoufox instance
-        )
-        try:
-            browser_raw = await camoufox.__aenter__()
-        except BaseException as enter_exc:
-            await _stop_camoufox(camoufox, enter_exc)
-            raise
-        try:
+            config={"forceScopeAccess": True},
+            disable_coop=True,
+        ) as browser_raw:
             browser = cast("Browser", browser_raw)
             context = await browser.new_context()
             page = await context.new_page()
@@ -184,13 +141,6 @@ async def get_camoufox(
                 attempt_delay=1,
             ) as solver:
                 yield CamoufoxDepClass(page, solver, context)
-        finally:
-            cleanup_error = None
-            cleanup_error = await _close_resource(page, "page.close()") or cleanup_error
-            cleanup_error = await _close_resource(context, "context.close()") or cleanup_error
-            cleanup_error = await _stop_camoufox(camoufox) or cleanup_error
-            if isinstance(cleanup_error, asyncio.CancelledError):
-                raise cleanup_error
     except HTTPException:
         raise
     except Exception as e:
