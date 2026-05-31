@@ -31,6 +31,12 @@ FINGERPRINT_CLEAR_BETWEEN = os.getenv(
     "FINGERPRINT_CLEAR_BETWEEN", "true"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
+# Hard cap (seconds) for closing/restarting the shared Camoufox instance.
+# If teardown hangs past this, the shared state is force-reset so the busy
+# flag is always released and the next request can spawn a fresh browser.
+BROWSER_SHUTDOWN_TIMEOUT = int(os.getenv("BROWSER_SHUTDOWN_TIMEOUT", "20"))
+
+
 HOST = os.getenv("HOST", "0.0.0.0")  # noqa: S104
 PORT = int(os.getenv("PORT", "8191"))
 

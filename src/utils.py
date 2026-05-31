@@ -1,3 +1,4 @@
+import asyncio
 import glob
 import logging
 import os
@@ -5,6 +6,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Annotated, NamedTuple, cast
 
 from camoufox import AsyncCamoufox
@@ -18,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from src.consts import (
     ADDON_PATH,
+    BROWSER_SHUTDOWN_TIMEOUT,
     FINGERPRINT_CLEAR_BETWEEN,
     FINGERPRINT_ROTATE_EVERY,
     LOG_LEVEL,
@@ -97,7 +100,7 @@ async def _close_resource(resource, resource_name: str) -> None:
         return
     try:
         await resource.close()
-    except (KeyboardInterrupt, SystemExit):
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
         raise
     except BaseException as cleanup_error:  # noqa: BLE001
         logger.warning("%s failed: %s", resource_name, cleanup_error)
@@ -117,7 +120,7 @@ async def _stop_camoufox(camoufox: AsyncCamoufox, exit_error: BaseException | No
             exit_error,
             exit_error.__traceback__ if exit_error else None,
         )
-    except (KeyboardInterrupt, SystemExit):
+    except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
         raise
     except BaseException as cleanup_error:  # noqa: BLE001
         logger.warning("Playwright stop failed: %s", cleanup_error)
@@ -175,26 +178,68 @@ async def _spawn_shared(proxy_config: dict[str, str | None] | None) -> None:
     )
 
 
+def _reset_shared_state() -> None:
+    """Drop all shared handles and delete the profile dir without awaiting."""
+    profile_dir = _shared.profile_dir
+    _shared.camoufox = None
+    _shared.context = None
+    _shared.page = None
+    _shared.profile_dir = None
+    _shared.uses_left = 0
+    if profile_dir is not None:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
 async def shutdown_shared_browser() -> None:
     """Close the shared Camoufox instance and remove its profile, if any."""
     if _shared.camoufox is None and _shared.profile_dir is None:
         return
+    camoufox = _shared.camoufox
+    page = _shared.page
+    context = _shared.context
     try:
-        await _close_resource(_shared.page, "page.close()")
-        await _close_resource(_shared.context, "context.close()")
-        if _shared.camoufox is not None:
-            await _stop_camoufox(_shared.camoufox)
+        await _close_resource(page, "page.close()")
+        await _close_resource(context, "context.close()")
+        if camoufox is not None:
+            await _stop_camoufox(camoufox)
     finally:
-        if _shared.profile_dir is not None:
-            shutil.rmtree(_shared.profile_dir, ignore_errors=True)
-        _shared.camoufox = None
-        _shared.context = None
-        _shared.page = None
-        _shared.profile_dir = None
-        _shared.uses_left = 0
+        _reset_shared_state()
 
 
-async def get_camoufox(
+async def _teardown_or_rotate(request_failed: bool) -> None:
+    """Close the browser on failure, or count down to a fingerprint rotation."""
+    if request_failed:
+        await shutdown_shared_browser()
+    elif FINGERPRINT_ROTATE_EVERY > 0:
+        _shared.uses_left -= 1
+        if _shared.uses_left <= 0:
+            await shutdown_shared_browser()
+
+
+async def _finalize_session(request_failed: bool) -> None:
+    """Run teardown/rotation under a hard timeout, always freeing the lock."""
+    try:
+        await asyncio.wait_for(
+            _teardown_or_rotate(request_failed),
+            timeout=BROWSER_SHUTDOWN_TIMEOUT,
+        )
+    except TimeoutError:
+        logger.error(
+            "Browser teardown exceeded %ss; force-resetting shared state",
+            BROWSER_SHUTDOWN_TIMEOUT,
+        )
+        _reset_shared_state()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException as teardown_error:  # noqa: BLE001
+        logger.error("Browser teardown failed: %s; force-resetting", teardown_error)
+        _reset_shared_state()
+    finally:
+        _shared.busy = False
+
+
+@asynccontextmanager
+async def camoufox_session(
     x_proxy_server: Annotated[
         str | None,
         Header(
@@ -217,9 +262,14 @@ async def get_camoufox(
 ) -> AsyncGenerator[CamoufoxDepClass]:
     """Yield a Camoufox-backed page/context shared across requests.
 
-    The same Camoufox process is reused for FINGERPRINT_ROTATE_EVERY
-    requests before being restarted with a fresh fingerprint. Only one
-    request at a time is served; concurrent callers get HTTP 429.
+    Unlike a FastAPI ``yield`` dependency, this context manager performs its
+    teardown (or fingerprint rotation) and releases the busy flag *before* the
+    request handler returns its response. That guarantees a caller that just
+    received a ``200`` is talking to a container that is already idle again.
+
+    The same Camoufox process is reused for ``FINGERPRINT_ROTATE_EVERY``
+    requests before being restarted with a fresh fingerprint. Only one request
+    at a time is served; concurrent callers get HTTP 429.
     """
     if _shared.busy:
         raise HTTPException(
@@ -280,21 +330,12 @@ async def get_camoufox(
                 max_attempts=MAX_ATTEMPTS,
                 attempt_delay=1,
             ) as solver:
-                try:
-                    yield CamoufoxDepClass(_shared.page, solver, _shared.context)
-                except BaseException:
-                    request_failed = True
-                    raise
+                yield CamoufoxDepClass(_shared.page, solver, _shared.context)
         except BaseException:
             request_failed = True
             raise
+    except BaseException:
+        request_failed = True
+        raise
     finally:
-        try:
-            if request_failed:
-                await shutdown_shared_browser()
-            elif FINGERPRINT_ROTATE_EVERY > 0:
-                _shared.uses_left -= 1
-                if _shared.uses_left <= 0:
-                    await shutdown_shared_browser()
-        finally:
-            _shared.busy = False
+        await _finalize_session(request_failed)

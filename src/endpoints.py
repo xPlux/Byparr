@@ -5,7 +5,7 @@ from http import HTTPStatus
 from typing import Annotated
 from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import RedirectResponse
 from playwright_captcha import CaptchaType
 
@@ -17,14 +17,12 @@ from src.models import (
     LinkResponse,
     Solution,
 )
-from src.utils import CamoufoxDepClass, TimeoutTimer, get_camoufox, logger
+from src.utils import CamoufoxDepClass, TimeoutTimer, camoufox_session, logger
 
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 
 router = APIRouter()
-
-CamoufoxDep = Annotated[CamoufoxDepClass, Depends(get_camoufox)]
 
 _COOKIE_SAME_SITE_MAP = {
     "none": "None",
@@ -107,11 +105,10 @@ def read_root():
 
 
 @router.get("/health")
-async def health_check(sb: CamoufoxDep):
+async def health_check():
     """Health check endpoint."""
     health_check_request = await read_item(
         LinkRequest.model_construct(url="https://google.com"),
-        sb,
     )
 
     if health_check_request.solution.status != HTTPStatus.OK:
@@ -124,8 +121,32 @@ async def health_check(sb: CamoufoxDep):
 
 
 @router.post("/v1")
-async def read_item(request: LinkRequest, dep: CamoufoxDep) -> LinkResponse:
-    """Handle POST requests."""
+async def read_item(
+    request: LinkRequest,
+    x_proxy_server: Annotated[
+        str | None,
+        Header(
+            alias="X-Proxy-Server",
+            description="Override proxy server for this request in protocol://host:port format.",
+        ),
+    ] = None,
+    x_proxy_username: Annotated[str | None, Header(alias="X-Proxy-Username")] = None,
+    x_proxy_password: Annotated[str | None, Header(alias="X-Proxy-Password")] = None,
+) -> LinkResponse:
+    """Handle POST requests.
+
+    The Camoufox lifecycle (spawn, rotation/teardown, busy release) is fully
+    contained in this handler, so the browser is already idle again by the time
+    this function returns its response to the client.
+    """
+    async with camoufox_session(
+        x_proxy_server, x_proxy_username, x_proxy_password
+    ) as dep:
+        return await _solve(request, dep)
+
+
+async def _solve(request: LinkRequest, dep: CamoufoxDepClass) -> LinkResponse:
+    """Drive the page through the request and build the response."""
     start_time = int(time.time() * 1000)
 
     timer = TimeoutTimer(duration=request.max_timeout)
