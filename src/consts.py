@@ -19,6 +19,18 @@ PROXY_SERVER = os.getenv("PROXY_SERVER")
 PROXY_USERNAME = os.getenv("PROXY_USERNAME")
 PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
 
+# How many requests share the same Camoufox process before it is restarted
+# with a fresh fingerprint. 1 = restart every request (legacy behavior),
+# 0 or negative = never rotate (keep one persona for the container lifetime).
+FINGERPRINT_ROTATE_EVERY = int(os.getenv("FINGERPRINT_ROTATE_EVERY", "1"))
+
+# When a Camoufox instance is reused across requests, clear cookies and
+# permissions plus open a fresh tab between requests. Has no effect when
+# FINGERPRINT_ROTATE_EVERY == 1, because the instance is recreated anyway.
+FINGERPRINT_CLEAR_BETWEEN = os.getenv(
+    "FINGERPRINT_CLEAR_BETWEEN", "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 HOST = os.getenv("HOST", "0.0.0.0")  # noqa: S104
 PORT = int(os.getenv("PORT", "8191"))
 
