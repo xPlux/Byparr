@@ -3,7 +3,9 @@ import glob
 import logging
 import os
 import shutil
+import signal
 import tempfile
+import threading
 import time
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -74,6 +76,102 @@ class TimeoutTimer(BaseModel):
     def remaining(self) -> float:
         """Get remaining time in seconds."""
         return max(0, self.duration - (time.perf_counter() - self.start_time))
+
+
+def _iter_descendant_pids(root_pid: int) -> list[int]:
+    """Return all descendant PIDs of root_pid via /proc (Linux only, best-effort)."""
+    try:
+        proc_entries = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return []
+
+    children: dict[int, list[int]] = {}
+    for pid_str in proc_entries:
+        try:
+            with open(f"/proc/{pid_str}/stat", encoding="utf-8") as stat_file:
+                data = stat_file.read()
+        except OSError:
+            continue
+        # comm field is wrapped in parentheses and may contain spaces, so the
+        # ppid is the 2nd field after the closing parenthesis.
+        rparen = data.rfind(")")
+        if rparen == -1:
+            continue
+        try:
+            ppid = int(data[rparen + 2 :].split()[1])
+        except (ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(pid_str))
+
+    descendants: list[int] = []
+    stack = [root_pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            descendants.append(child)
+            stack.append(child)
+    return descendants
+
+
+def _proc_name(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as comm_file:
+            return comm_file.read().strip()
+    except OSError:
+        return ""
+
+
+def kill_browser_processes() -> int:
+    """SIGKILL any camoufox/firefox descendant of this process.
+
+    Last-resort action when the asyncio deadline cannot be enforced (event-loop
+    starvation under heavy CPU load, or a Playwright op ignoring cooperative
+    cancellation). Killing the browser makes the stuck call fail immediately so
+    the request unwinds and the busy flag is released. Linux/proc based and
+    best-effort: returns the number of processes signalled.
+    """
+    if not hasattr(signal, "SIGKILL"):
+        return 0
+    killed = 0
+    for pid in _iter_descendant_pids(os.getpid()):
+        name = _proc_name(pid).lower()
+        if "firefox" in name or "camoufox" in name:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                continue
+            killed += 1
+    return killed
+
+
+class BrowserWatchdog:
+    """Hard-deadline watchdog running on an OS thread, independent of the loop.
+
+    If armed and not disarmed within ``timeout`` seconds, it force-kills the
+    browser process. Because it runs on a separate thread (not the asyncio event
+    loop), it still fires when the loop is starved by CPU-bound work — something
+    ``asyncio.wait_for`` cannot guarantee.
+    """
+
+    def __init__(self, timeout: float) -> None:
+        self._timer = threading.Timer(timeout, self._fire)
+        self._timer.daemon = True
+        self.fired = False
+
+    def _fire(self) -> None:
+        self.fired = True
+        killed = kill_browser_processes()
+        logger.error(
+            "Watchdog deadline exceeded; force-killed %d browser process(es)",
+            killed,
+        )
+
+    def __enter__(self) -> "BrowserWatchdog":
+        self._timer.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._timer.cancel()
+
 
 
 class CamoufoxDepClass(NamedTuple):

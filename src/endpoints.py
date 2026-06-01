@@ -17,7 +17,13 @@ from src.models import (
     LinkResponse,
     Solution,
 )
-from src.utils import CamoufoxDepClass, TimeoutTimer, camoufox_session, logger
+from src.utils import (
+    BrowserWatchdog,
+    CamoufoxDepClass,
+    TimeoutTimer,
+    camoufox_session,
+    logger,
+)
 
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
@@ -140,28 +146,48 @@ async def read_item(
     this function returns its response to the client.
     """
     phase = _Phase()
+    deadline = request.max_timeout + REQUEST_DEADLINE_MARGIN
     async with camoufox_session(
         x_proxy_server, x_proxy_username, x_proxy_password
     ) as dep:
-        try:
-            return await wait_for(
-                _solve(request, dep, phase),
-                timeout=request.max_timeout + REQUEST_DEADLINE_MARGIN,
-            )
-        except TimeoutError as e:
-            logger.error(
-                "Request to %s exceeded hard deadline of %ss while %s",
-                request.url,
-                request.max_timeout,
-                phase.name,
-            )
-            raise HTTPException(
-                status_code=408,
-                detail=(
-                    f"Request exceeded maxTimeout of {request.max_timeout}s "
-                    f"and was aborted while {phase.name}"
-                ),
-            ) from e
+        # The asyncio.wait_for below enforces the deadline cooperatively. The
+        # watchdog is the hard fallback: it runs on an OS thread and force-kills
+        # the browser if the event loop is too starved (high CPU) to fire the
+        # cooperative timeout. It is armed slightly later so the clean path wins
+        # whenever the loop is healthy.
+        with BrowserWatchdog(deadline + REQUEST_DEADLINE_MARGIN) as watchdog:
+            try:
+                return await wait_for(_solve(request, dep, phase), timeout=deadline)
+            except TimeoutError as e:
+                logger.error(
+                    "Request to %s exceeded hard deadline of %ss while %s",
+                    request.url,
+                    request.max_timeout,
+                    phase.name,
+                )
+                raise HTTPException(
+                    status_code=408,
+                    detail=(
+                        f"Request exceeded maxTimeout of {request.max_timeout}s "
+                        f"and was aborted while {phase.name}"
+                    ),
+                ) from e
+            except Exception as e:
+                if watchdog.fired:
+                    logger.error(
+                        "Request to %s force-killed by watchdog after %ss while %s",
+                        request.url,
+                        request.max_timeout,
+                        phase.name,
+                    )
+                    raise HTTPException(
+                        status_code=408,
+                        detail=(
+                            f"Request exceeded maxTimeout of {request.max_timeout}s; "
+                            f"browser was force-killed while {phase.name}"
+                        ),
+                    ) from e
+                raise
 
 
 class _Phase:
