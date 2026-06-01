@@ -9,7 +9,7 @@ from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import RedirectResponse
 from playwright_captcha import CaptchaType
 
-from src.consts import CHALLENGE_TITLES
+from src.consts import CHALLENGE_TITLES, REQUEST_DEADLINE_MARGIN
 from src.models import (
     HealthcheckResponse,
     InputCookie,
@@ -139,13 +139,58 @@ async def read_item(
     contained in this handler, so the browser is already idle again by the time
     this function returns its response to the client.
     """
+    phase = _Phase()
     async with camoufox_session(
         x_proxy_server, x_proxy_username, x_proxy_password
     ) as dep:
-        return await _solve(request, dep)
+        try:
+            return await wait_for(
+                _solve(request, dep, phase),
+                timeout=request.max_timeout + REQUEST_DEADLINE_MARGIN,
+            )
+        except TimeoutError as e:
+            logger.error(
+                "Request to %s exceeded hard deadline of %ss while %s",
+                request.url,
+                request.max_timeout,
+                phase.name,
+            )
+            raise HTTPException(
+                status_code=408,
+                detail=(
+                    f"Request exceeded maxTimeout of {request.max_timeout}s "
+                    f"and was aborted while {phase.name}"
+                ),
+            ) from e
 
 
-async def _solve(request: LinkRequest, dep: CamoufoxDepClass) -> LinkResponse:
+class _Phase:
+    """Mutable holder for the operation currently in progress.
+
+    Lets both the per-operation handler in ``_solve`` and the outer hard-deadline
+    handler in ``read_item`` report which step was running when a timeout fired.
+    """
+
+    def __init__(self) -> None:
+        self.name = "starting request"
+
+
+def _remaining_ms(timer: TimeoutTimer) -> float:
+    """Remaining budget in ms, raising once exhausted.
+
+    Playwright treats ``timeout=0`` as "wait forever", so a depleted budget must
+    never be passed straight through — otherwise an operation would hang past
+    maxTimeout. Raising here yields a clean 408 instead.
+    """
+    remaining = timer.remaining()
+    if remaining <= 0:
+        raise TimeoutError("Request deadline exceeded")
+    return remaining * 1000
+
+
+async def _solve(
+    request: LinkRequest, dep: CamoufoxDepClass, phase: "_Phase"
+) -> LinkResponse:
     """Drive the page through the request and build the response."""
     start_time = int(time.time() * 1000)
 
@@ -154,6 +199,7 @@ async def _solve(request: LinkRequest, dep: CamoufoxDepClass) -> LinkResponse:
     request.url = request.url.replace('"', "").strip()
 
     if request.cookies:
+        phase.name = "applying request cookies"
         try:
             await dep.context.add_cookies(
                 _to_playwright_cookies(request.cookies, request.url)
@@ -165,20 +211,25 @@ async def _solve(request: LinkRequest, dep: CamoufoxDepClass) -> LinkResponse:
             raise HTTPException(status_code=422, detail="Invalid cookies format") from e
 
     try:
+        phase.name = f"navigating to {request.url}"
         page_request = await dep.page.goto(
-            request.url, timeout=timer.remaining() * 1000
+            request.url, timeout=_remaining_ms(timer)
         )
         status = page_request.status if page_request else HTTPStatus.OK
+        phase.name = "waiting for page DOM to load (domcontentloaded)"
         await dep.page.wait_for_load_state(
-            state="domcontentloaded", timeout=timer.remaining() * 1000
+            state="domcontentloaded", timeout=_remaining_ms(timer)
         )
+        phase.name = "waiting for network to go idle (networkidle)"
         await dep.page.wait_for_load_state(
-            "networkidle", timeout=timer.remaining() * 1000
+            "networkidle", timeout=_remaining_ms(timer)
         )
 
+        phase.name = "reading page title"
         if await dep.page.title() in CHALLENGE_TITLES:
             logger.info("Challenge detected, attempting to solve...")
             # Solve the captcha
+            phase.name = "solving the Cloudflare challenge"
             await wait_for(
                 dep.solver.solve_captcha(  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
                     captcha_container=dep.page,
@@ -186,36 +237,42 @@ async def _solve(request: LinkRequest, dep: CamoufoxDepClass) -> LinkResponse:
                     wait_checkbox_attempts=1,
                     wait_checkbox_delay=0.5,
                 ),
-                timeout=timer.remaining(),
+                timeout=_remaining_ms(timer) / 1000,
             )
             status = HTTPStatus.OK
             logger.debug("Challenge solved successfully.")
     except TimeoutError as e:
-        logger.error("Timed out while solving the challenge")
+        logger.error("Timed out while %s", phase.name)
         raise HTTPException(
             status_code=408,
-            detail="Timed out while solving the challenge",
+            detail=f"Timed out while {phase.name}",
         ) from e
     except HTTPException:
         raise
     except Exception as e:
-        logger.error("Browser request failed: %s", e)
+        logger.error("Browser request failed while %s: %s", phase.name, e)
         raise HTTPException(
             status_code=502,
-            detail=f"Browser request failed: {e}",
+            detail=f"Browser request failed while {phase.name}: {e}",
         ) from e
 
+    phase.name = "collecting cookies"
     cookies = await dep.context.cookies()
+
+    phase.name = "reading user agent"
+    user_agent = await dep.page.evaluate("navigator.userAgent")
+    phase.name = "reading page content"
+    response_content = await dep.page.content()
 
     return LinkResponse(
         message="Success",
         solution=Solution(
-            user_agent=await dep.page.evaluate("navigator.userAgent"),
+            user_agent=user_agent,
             url=dep.page.url,
             status=status,
             cookies=cookies,
             headers=page_request.headers if page_request else {},
-            response=await dep.page.content(),
+            response=response_content,
         ),
         start_timestamp=start_time,
     )

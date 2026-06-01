@@ -36,6 +36,15 @@ FINGERPRINT_CLEAR_BETWEEN = os.getenv(
 # flag is always released and the next request can spawn a fresh browser.
 BROWSER_SHUTDOWN_TIMEOUT = int(os.getenv("BROWSER_SHUTDOWN_TIMEOUT", "20"))
 
+# Extra seconds added on top of a request's maxTimeout before the WHOLE request
+# is force-cancelled. Per-operation timeouts (page.goto, wait_for_load_state,
+# solve_captcha) use the maxTimeout budget and fire their own specific errors
+# first; this margin is the hard ceiling that cancels any operation which
+# ignores the budget (e.g. unguarded page.content()/evaluate()), guaranteeing
+# the browser is released and never left stuck busy.
+REQUEST_DEADLINE_MARGIN = int(os.getenv("REQUEST_DEADLINE_MARGIN", "5"))
+
+
 
 HOST = os.getenv("HOST", "0.0.0.0")  # noqa: S104
 PORT = int(os.getenv("PORT", "8191"))
